@@ -22,8 +22,9 @@ def _resolve_alpha(image, mask=None, chroma_key="", chroma_tolerance=0.10,
 
     `mask_mode` matters because ComfyUI's own mask convention is INVERTED
     relative to naive intuition: `LoadImage` emits `mask = 1 - alpha`, i.e.
-    **1 means transparent** (it is an inpainting mask). Masks produced by the
-    nodes in this pack use the opposite, natural convention (1 = opaque).
+    **1 means transparent** (it is an inpainting mask), and every core consumer
+    flips it back (`JoinImageWithAlpha` does `alpha = 1.0 - mask`). Nodes in
+    this pack therefore also EMIT 1 = transparent -- see `_to_comfy_mask`.
 
       auto       -> decide from the image border (a sprite/tile is transparent
                     at the frame edge), reported back through `info`
@@ -102,6 +103,24 @@ def _resolve_alpha(image, mask=None, chroma_key="", chroma_tolerance=0.10,
 
 
 RESIDUE_COLORS = ("#000000", "#ff00ff")
+
+
+def _to_comfy_mask(alpha):
+    """Convert the internal alpha (1=opaque) to a ComfyUI MASK (1=transparent).
+
+    This is the single most important interop detail in the whole pack. ComfyUI
+    MASKs are *inverted* with respect to alpha: `LoadImage` emits `1 - alpha`,
+    and every core consumer flips it back --
+    `JoinImageWithAlpha` runs `alpha = 1.0 - mask`, `ImageCompositeMasked`
+    composites where the mask is 0, and so on.
+
+    Emitting 1=opaque used to make every downstream node interpret the sprite
+    upside down: the artwork became the hole and the background became solid, so
+    the result looked like full-frame noise. Returning 1=transparent means the
+    plain `Join Image with Alpha` node works with no special handling.
+    """
+    return (1.0 - alpha).clamp(0.0, 1.0)
+
 
 
 def _residue_warning(image, alpha):
@@ -573,11 +592,14 @@ class PixelGrid_KMeansSkipTransparent:
         (or flat-filled when fill != "edge"); an RGB tensor cannot hold alpha,
         the real alpha is in `mask`.
       - hex_palette (STRING): opaque colors only, de-duplicated.
-      - mask (MASK): the alpha (1=opaque, 0=transparent) for re-compositing.
+      - mask (MASK): the transparency, in ComfyUI's native convention
+        (1=transparent, 0=opaque). Feed it to `Join Image with Alpha` together
+        with `quantized_image` to get a real RGBA image.
 
-    `mask_mode` covers the mask-convention trap: ComfyUI's own `LoadImage` MASK
-    is `1 - alpha` (1 = transparent), while this pack emits 1 = opaque. "auto"
-    decides from the image border, which is transparent for a sprite/tile.
+    `mask_mode` covers the mask-convention trap on the INPUT side: ComfyUI's own
+    `LoadImage` MASK is `1 - alpha` (1 = transparent). "auto" decides from the
+    image border, which is transparent for a sprite/tile. The MASK this node
+    EMITS is always 1=transparent, matching ComfyUI.
 
     ComfyUI's IMAGE type is RGB-native (a 4-channel IMAGE is not standard and is
     rejected/noised downstream), so this node does NOT try to emit RGBA. The
@@ -630,7 +652,7 @@ class PixelGrid_KMeansSkipTransparent:
 
         # Fallback: nothing opaque -> just pass through
         if opaque_px.shape[0] == 0:
-            out_mask = opaque.reshape(B, H, W).to(torch.float32)
+            out_mask = _to_comfy_mask(opaque.reshape(B, H, W).to(torch.float32))
             return (image, "", out_mask)
 
         # K-Means (10 iters) on OPAQUE pixels only
@@ -686,7 +708,9 @@ class PixelGrid_KMeansSkipTransparent:
         unique_pal = sorted({tuple(int(v) for v in c) for c in palette_rgb})
         hex_string = ", ".join(rgb_to_hex(list(c)) for c in unique_pal)
 
-        out_mask = opaque.reshape(B, H, W).to(torch.float32)
+        # ComfyUI-native MASK: 1 = transparent (see _to_comfy_mask), so it can
+        # go straight into `Join Image with Alpha` / `ImageCompositeMasked`.
+        out_mask = _to_comfy_mask(opaque.reshape(B, H, W).to(torch.float32))
         return (out_img, hex_string, out_mask)
 
 
@@ -745,7 +769,7 @@ class PixelGrid_Defringe:
             fixed = _edge_extend_rgb(image[b, :, :, :3].cpu().numpy(), opaque)
             out[b] = torch.from_numpy(fixed).to(device=out.device, dtype=out.dtype)
 
-        return (out, alpha)
+        return (out, _to_comfy_mask(alpha))
 
 
 class PixelGrid_RestoreTransparency:
@@ -771,7 +795,8 @@ class PixelGrid_RestoreTransparency:
 
     Outputs:
       image (IMAGE): fill-free RGB, safe to resize.
-      mask  (MASK) : alpha, same values as the input mask (1=opaque, 0=clear).
+      mask  (MASK) : transparency in ComfyUI's native convention
+                     (1=transparent, 0=opaque) -- wire into Join Image with Alpha.
       report (STRING): what actually happened -- see it in the console too.
     """
 
@@ -833,8 +858,8 @@ class PixelGrid_RestoreTransparency:
         if mask is None and not (chroma_key and chroma_key.strip()):
             report += " | WARNING: no mask/chroma_key -> nothing to restore"
             print(f"[Pixel Grid] Restore Transparency: {report}")
-            print("[Pixel Grid]   -> connect Quantize's `mask` output (1=opaque) "
-                  "or LoadImage's MASK (1=transparent, use mask_mode=opaque_is_0)")
+            print("[Pixel Grid]   -> connect Quantize's `mask` output or "
+                  "LoadImage's MASK (both 1=transparent, mask_mode=auto)")
         elif repainted == 0:
             report += " | nothing repainted (alpha is fully opaque)"
             print(f"[Pixel Grid] Restore Transparency: {report}")
@@ -843,4 +868,6 @@ class PixelGrid_RestoreTransparency:
         else:
             print(f"[Pixel Grid] Restore Transparency: {report}")
 
-        return (out, alpha, report)
+        # Emit the ComfyUI-native MASK (1 = transparent) so this output can be
+        # wired straight into `Join Image with Alpha`.
+        return (out, _to_comfy_mask(alpha), report)

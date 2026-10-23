@@ -256,7 +256,7 @@ socket instead of as a 4th channel).
 | --- | --- |
 | `quantized_image` | Quantized RGB. The transparent area is edge-padded (default) or holds `fill`. |
 | `hex_palette` | Opaque colors only, de-duplicated. |
-| `mask` | The alpha, unchanged (1 = opaque, 0 = transparent). |
+| `mask` | Transparency in **ComfyUI's native convention (1 = transparent)**, so it can go straight into `Join Image with Alpha`. |
 
 Unlike the plain **Quantize (Max Colors)** node, transparent pixels never enter
 the clustering, so chroma-key residue can no longer produce purple noise.
@@ -290,14 +290,14 @@ merging and quantizing.
 | --- | --- |
 | `image` | Image whose transparent area holds a flat fill color. |
 | `mask` (optional) | Alpha. Resampled automatically if its size differs from the image. |
-| `mask_mode` (optional) | `auto` / `opaque_is_1` / `opaque_is_0` — same meaning as above. Watch out: ComfyUI's `LoadImage` MASK is **1 = transparent**. |
+| `mask_mode` (optional) | `auto` / `opaque_is_1` / `opaque_is_0` — applies to the **input** only. ComfyUI's `LoadImage` MASK is **1 = transparent**; the node's own output is always 1 = transparent too. |
 | `chroma_key` / `chroma_tolerance` | Alternative to `mask` when only a solid background color is known. |
 | `alpha_threshold` | Alpha at or above this counts as opaque (the color source for padding). |
 
 | Output | Usage |
 | --- | --- |
 | `image` | Fill-free RGB, safe to resize. |
-| `mask` | Alpha, unchanged (1 = opaque). |
+| `mask` | Transparency in **ComfyUI's native convention (1 = transparent)** — wire into `Join Image with Alpha`. |
 | `report` | One-line summary of what it did — also printed to the console. |
 
 The transparent area is **edge-padded**: every pixel outside the mask is
@@ -326,7 +326,9 @@ removal), which is what makes halos appear when the sprite is resized.
 - **Inspect and describe colors:** Connect any `hex_palette` output to Palette to Image for swatches and HEX to Color Names for readable names.
 - **Recover a known pixel grid:** Image -> Median Fixer -> use `downscaled_image` for editing or `original_size_image` for an enlarged result.
 - **Create a flat background:** Create Solid Color Image -> Preview Image or combine it with another image.
-- **Transparent pixel art, end to end:** Image -> *Quantize Skip Transparent* (`quantized_image`, `mask`) -> *Restore Transparency* -> resize / merge -> composite the `mask` back as alpha at the very end. Insert *Defringe* right after background removal if the edges still carry white/magenta residue.
+- **Transparent pixel art, end to end:** Image -> *Quantize Skip Transparent* (`quantized_image`, `mask`) -> **Join Image with Alpha** -> resize / merge on RGBA -> SaveImage (writes a real transparent PNG).
+  Joining alpha *before* resizing is what keeps the sprite clean: ComfyUI's `ImageScale` does not premultiply, so scaling RGBA with the mask already attached (and the transparent area edge-padded) avoids both dark and bright halos.
+  Insert *Defringe* right after background removal if the edges still carry white/magenta residue.
 
 ## Attribution
 

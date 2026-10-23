@@ -9,14 +9,28 @@ def rgb_to_hex(rgb):
     return '#{:02x}{:02x}{:02x}'.format(int(rgb[0]), int(rgb[1]), int(rgb[2]))
 
 
-def _resolve_alpha(image, mask=None, chroma_key="", chroma_tolerance=0.10):
-    """Build a [B,H,W] float alpha (0=transparent, 1=opaque) from any source.
+OPAQUE_IS_1 = "opaque_is_1"      # 1 = drawn/opaque  (this pack's own convention)
+OPAQUE_IS_0 = "opaque_is_0"      # 1 = clear/transparent (ComfyUI LoadImage's MASK!)
+MASK_MODES = ["auto", OPAQUE_IS_1, OPAQUE_IS_0]
+
+
+def _resolve_alpha(image, mask=None, chroma_key="", chroma_tolerance=0.10,
+                   mask_mode="auto", info=None):
+    """Build a [B,H,W] float alpha (1=opaque, 0=transparent) from any source.
 
     Priority: MASK input > chroma_key hex > everything opaque.
 
+    `mask_mode` matters because ComfyUI's own mask convention is INVERTED
+    relative to naive intuition: `LoadImage` emits `mask = 1 - alpha`, i.e.
+    **1 means transparent** (it is an inpainting mask). Masks produced by the
+    nodes in this pack use the opposite, natural convention (1 = opaque).
+
+      auto       -> decide from the image border (a sprite/tile is transparent
+                    at the frame edge), reported back through `info`
+      opaque_is_1 / opaque_is_0 -> force one interpretation
+
     The mask is resampled to the image size when they disagree (happens when the
-    IMAGE was scaled but the MASK was not) and broadcast across the batch, so
-    callers never have to worry about matching shapes.
+    IMAGE was scaled but the MASK was not) and broadcast across the batch.
     """
     B, H, W, _ = image.shape
     if mask is not None:
@@ -33,7 +47,24 @@ def _resolve_alpha(image, mask=None, chroma_key="", chroma_tolerance=0.10):
             m = torch.cat([m, m[-1:].expand(B - m.shape[0], H, W)], dim=0)
         elif m.shape[0] > B:
             m = m[:B]
+        m = m.clamp(0.0, 1.0)
+
+        mode = mask_mode
+        if mode == "auto":
+            # Border heuristic: for a sprite/tile the frame edge is background.
+            # Pick whichever interpretation makes that edge transparent.
+            border = torch.cat([m[0, 0, :], m[0, -1, :], m[0, :, 0], m[0, :, -1]])
+            mode = OPAQUE_IS_0 if float(border.mean()) > 0.5 else OPAQUE_IS_1
+        if mode == OPAQUE_IS_0:
+            m = 1.0 - m
+
+        if info is not None:
+            info["mask_source"] = "mask input"
+            info["mask_mode"] = mode
+            if mode != mask_mode:
+                info["mask_mode"] += " (auto)"
         return m.clamp(0.0, 1.0)
+
     if chroma_key and chroma_key.strip():
         key = torch.tensor(
             list(hex_to_rgb(chroma_key.strip())),
@@ -41,7 +72,14 @@ def _resolve_alpha(image, mask=None, chroma_key="", chroma_tolerance=0.10):
         ) / 255.0
         px = image[..., :3].reshape(-1, 3)
         dist = torch.sqrt(((px - key) ** 2).sum(dim=1))
+        if info is not None:
+            info["mask_source"] = f"chroma_key {chroma_key.strip()} tol {chroma_tolerance}"
+            info["mask_mode"] = "-"
         return (dist > chroma_tolerance).to(torch.float32).reshape(B, H, W)
+
+    if info is not None:
+        info["mask_source"] = "none -> assumed all opaque"
+        info["mask_mode"] = "-"
     return torch.ones((B, H, W), dtype=torch.float32, device=image.device)
 
 
@@ -472,23 +510,28 @@ class PixelGrid_KMeansSkipTransparent:
     purple/magenta "noise". This node excludes transparent pixels from the
     clustering, so the background can never pollute the palette.
 
-    Transparent pixels are filled with a single uniform color afterwards so
-    they stay invisible once the mask is re-attached (and never claim an
-    extra palette slot when fill="dominant").
+    Transparent pixels still need SOME value in an RGB tensor. `fill="edge"`
+    (default) edge-pads them with the nearest opaque palette color, so nothing
+    foreign is left behind -- that is what keeps a later smooth resize from
+    smearing a black/white halo, and it is why the preview no longer shows a
+    black background. The flat options (dominant/black/magenta) are still there
+    if you explicitly want a keyable solid color.
 
     Outputs:
-      - quantized_image (RGB): quantized artwork. Transparent pixels are filled
-        with `fill` (dominant/black/magenta) only because an RGB tensor cannot
-        hold transparency -- the real alpha is in `mask`.
+      - quantized_image (RGB): quantized artwork, transparent area edge-padded
+        (or flat-filled when fill != "edge"); an RGB tensor cannot hold alpha,
+        the real alpha is in `mask`.
       - hex_palette (STRING): opaque colors only, de-duplicated.
       - mask (MASK): the alpha (1=opaque, 0=transparent) for re-compositing.
+
+    `mask_mode` covers the mask-convention trap: ComfyUI's own `LoadImage` MASK
+    is `1 - alpha` (1 = transparent), while this pack emits 1 = opaque. "auto"
+    decides from the image border, which is transparent for a sprite/tile.
 
     ComfyUI's IMAGE type is RGB-native (a 4-channel IMAGE is not standard and is
     rejected/noised downstream), so this node does NOT try to emit RGBA. The
     alpha rides along in `mask`; feed `quantized_image` + `mask` into
-    `Pixel Grid: Restore Transparency` to key the fill back out and continue
-    the pipeline (the fill color would otherwise smear into the edges on any
-    smooth resize).
+    `Pixel Grid: Restore Transparency` to key any flat fill back out.
     """
 
     @classmethod
@@ -500,9 +543,10 @@ class PixelGrid_KMeansSkipTransparent:
             },
             "optional": {
                 "mask": ("MASK",),
+                "mask_mode": (MASK_MODES, {"default": "auto"}),
                 "chroma_key": ("STRING", {"multiline": False, "default": ""}),
                 "chroma_tolerance": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "fill": (["dominant", "black", "magenta"], {"default": "dominant"}),
+                "fill": (["edge", "dominant", "black", "magenta"], {"default": "edge"}),
             }
         }
 
@@ -512,32 +556,25 @@ class PixelGrid_KMeansSkipTransparent:
     CATEGORY = "Pixel Grid Helpers"
 
     @staticmethod
-    def _to_opaque_mask(image, mask, chroma_key, chroma_tolerance):
-        B, H, W, _ = image.shape
-        n = B * H * W
-        if mask is not None:
-            m = mask.reshape(-1)
-            if m.shape[0] != n:
-                # take only the first plane / first batch worth of pixels
-                m = m[:n]
-            return (m > 0.5)
-        if chroma_key and chroma_key.strip():
-            key = torch.tensor(
-                list(hex_to_rgb(chroma_key.strip())),
-                dtype=torch.float32, device=image.device,
-            ) / 255.0
-            px = image.reshape(-1, 3)
-            dist = torch.sqrt(((px - key) ** 2).sum(dim=1))
-            return (dist > chroma_tolerance)
-        # No transparency info supplied -> behave exactly like the original node
-        return torch.ones(n, dtype=torch.bool, device=image.device)
+    def _to_opaque_mask(image, mask, chroma_key, chroma_tolerance,
+                        mask_mode="auto", info=None):
+        alpha = _resolve_alpha(image, mask, chroma_key, chroma_tolerance,
+                               mask_mode, info)
+        return alpha.reshape(-1) > 0.5
 
-    def quantize(self, image, max_colors, mask=None, chroma_key="",
-                 chroma_tolerance=0.10, fill="dominant"):
+    def quantize(self, image, max_colors, mask=None, mask_mode="auto",
+                 chroma_key="", chroma_tolerance=0.10, fill="edge"):
         B, H, W, _ = image.shape
         pixels = image.reshape(-1, 3)            # [N, 3]
-        opaque = self._to_opaque_mask(image, mask, chroma_key, chroma_tolerance)
+        info = {}
+        opaque = self._to_opaque_mask(image, mask, chroma_key, chroma_tolerance,
+                                      mask_mode, info)
         opaque_px = pixels[opaque]
+
+        print(f"[Pixel Grid] Quantize Skip Transparent: {W}x{H} | "
+              f"transparency from {info.get('mask_source')} | "
+              f"mask_mode {info.get('mask_mode')} | "
+              f"opaque {100.0 * float(opaque.sum()) / max(1, opaque.numel()):.1f}%")
 
         # Fallback: nothing opaque -> just pass through
         if opaque_px.shape[0] == 0:
@@ -568,16 +605,29 @@ class PixelGrid_KMeansSkipTransparent:
         out = pixels.clone()
         out[opaque] = centroids[labels]
 
-        if fill == "black":
-            fcol = torch.tensor([0.0, 0.0, 0.0], device=image.device)
-        elif fill == "magenta":
-            fcol = torch.tensor([1.0, 0.0, 1.0], device=image.device)
-        else:  # dominant -> most populated centroid (reuses an existing slot)
-            counts = torch.bincount(labels, minlength=max_colors)
-            fcol = centroids[counts.argmax()].clone()
-        out[~opaque] = fcol
+        if fill == "edge":
+            # Edge-pad the transparent area with the nearest OPAQUE (already
+            # quantized) color instead of a flat fill. Nothing foreign is left
+            # in the RGB tensor, so a later bilinear/lanczos resize cannot smear
+            # a black/white halo into the silhouette, and no "black background"
+            # shows up in preview either.
+            out3 = out.view(B, H, W, 3)
+            om = opaque.reshape(B, H, W)
+            for b in range(B):
+                fixed = _edge_extend_rgb(
+                    out3[b].cpu().numpy(), om[b].cpu().numpy())
+                out3[b] = torch.from_numpy(fixed).to(device=out.device, dtype=out.dtype)
+        else:
+            if fill == "black":
+                fcol = torch.tensor([0.0, 0.0, 0.0], device=image.device)
+            elif fill == "magenta":
+                fcol = torch.tensor([1.0, 0.0, 1.0], device=image.device)
+            else:  # dominant -> most populated centroid (reuses an existing slot)
+                counts = torch.bincount(labels, minlength=max_colors)
+                fcol = centroids[counts.argmax()].clone()
+            out[~opaque] = fcol
 
-        out_img = out.reshape(image.shape)
+        out_img = out.view(image.shape)
 
         # Palette = opaque centroids only (no purple noise), de-duplicated
         palette_rgb = (centroids * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
@@ -616,6 +666,7 @@ class PixelGrid_Defringe:
             },
             "optional": {
                 "mask": ("MASK",),
+                "mask_mode": (MASK_MODES, {"default": "auto"}),
                 "chroma_key": ("STRING", {"multiline": False, "default": ""}),
                 "chroma_tolerance": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "alpha_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
@@ -628,13 +679,13 @@ class PixelGrid_Defringe:
     CATEGORY = "Pixel Grid Helpers"
 
     @staticmethod
-    def _alpha(image, mask, chroma_key, chroma_tolerance):
-        return _resolve_alpha(image, mask, chroma_key, chroma_tolerance)
+    def _alpha(image, mask, chroma_key, chroma_tolerance, mask_mode="auto"):
+        return _resolve_alpha(image, mask, chroma_key, chroma_tolerance, mask_mode)
 
-    def defringe(self, image, mask=None, chroma_key="", chroma_tolerance=0.10,
-                 alpha_threshold=0.5):
+    def defringe(self, image, mask=None, mask_mode="auto", chroma_key="",
+                 chroma_tolerance=0.10, alpha_threshold=0.5):
         B, H, W, _ = image.shape
-        alpha = _resolve_alpha(image, mask, chroma_key, chroma_tolerance)
+        alpha = _resolve_alpha(image, mask, chroma_key, chroma_tolerance, mask_mode)
         out = image[..., :3].clone()
 
         for b in range(B):
@@ -669,6 +720,7 @@ class PixelGrid_RestoreTransparency:
     Outputs:
       image (IMAGE): fill-free RGB, safe to resize.
       mask  (MASK) : alpha, same values as the input mask (1=opaque, 0=clear).
+      report (STRING): what actually happened -- see it in the console too.
     """
 
     @classmethod
@@ -679,25 +731,64 @@ class PixelGrid_RestoreTransparency:
             },
             "optional": {
                 "mask": ("MASK",),
+                "mask_mode": (MASK_MODES, {"default": "auto"}),
                 "chroma_key": ("STRING", {"multiline": False, "default": ""}),
                 "chroma_tolerance": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "alpha_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK")
-    RETURN_NAMES = ("image", "mask")
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("image", "mask", "report")
     FUNCTION = "restore"
     CATEGORY = "Pixel Grid Helpers"
 
-    def restore(self, image, mask=None, chroma_key="", chroma_tolerance=0.10,
-                alpha_threshold=0.5):
-        alpha = _resolve_alpha(image, mask, chroma_key, chroma_tolerance)
+    def restore(self, image, mask=None, mask_mode="auto", chroma_key="",
+                chroma_tolerance=0.10, alpha_threshold=0.5):
+        import numpy as np
+
+        B, H, W, _ = image.shape
+        info = {}
+        alpha = _resolve_alpha(image, mask, chroma_key, chroma_tolerance,
+                               mask_mode, info)
         out = image[..., :3].clone()
 
-        for b in range(image.shape[0]):
+        repainted = 0
+        fill_guess = None
+        for b in range(B):
             opaque = alpha[b].cpu().numpy() >= alpha_threshold
+            if fill_guess is None and not opaque.all() and opaque.any():
+                y, x = np.argwhere(~opaque)[0]
+                c = image[b, y, x, :3].cpu().numpy() * 255.0
+                fill_guess = rgb_to_hex(c)
+            repainted += int((~opaque).sum())
             fixed = _edge_extend_rgb(image[b, :, :, :3].cpu().numpy(), opaque)
             out[b] = torch.from_numpy(fixed).to(device=out.device, dtype=out.dtype)
 
-        return (out, alpha)
+        total = max(1, B * H * W)
+        a = alpha.detach().cpu().float()
+        report = (
+            f"{W}x{H} | transparency from {info.get('mask_source')} "
+            f"| mask_mode {info.get('mask_mode')} "
+            f"| alpha min {float(a.min()):.2f} max {float(a.max()):.2f} "
+            f"mean {float(a.mean()):.2f} "
+            f"| opaque {100.0 * (total - repainted) / total:.1f}% "
+            f"| repainted {100.0 * repainted / total:.1f}%"
+        )
+        if fill_guess:
+            report += f" | removed fill ~{fill_guess}"
+
+        if mask is None and not (chroma_key and chroma_key.strip()):
+            report += " | WARNING: no mask/chroma_key -> nothing to restore"
+            print(f"[Pixel Grid] Restore Transparency: {report}")
+            print("[Pixel Grid]   -> connect Quantize's `mask` output (1=opaque) "
+                  "or LoadImage's MASK (1=transparent, use mask_mode=opaque_is_0)")
+        elif repainted == 0:
+            report += " | nothing repainted (alpha is fully opaque)"
+            print(f"[Pixel Grid] Restore Transparency: {report}")
+            print("[Pixel Grid]   -> the mask says every pixel is solid; check "
+                  "mask_mode (ComfyUI LoadImage MASK is 1=transparent)")
+        else:
+            print(f"[Pixel Grid] Restore Transparency: {report}")
+
+        return (out, alpha, report)

@@ -247,15 +247,16 @@ socket instead of as a 4th channel).
 | `image` | Source image. |
 | `max_colors` | Palette size, counted over **opaque pixels only**. |
 | `mask` (optional) | Alpha, e.g. `LoadImage`'s `MASK` output. |
+| `mask_mode` (optional) | Which way round the mask is: `auto` (default, decides from the image border), `opaque_is_1` (this pack's own masks) or `opaque_is_0` (ComfyUI `LoadImage`'s `MASK` is `1 - alpha`, i.e. **1 = transparent**). |
 | `chroma_key` (optional) | Hex color treated as background (e.g. `#FF00FF`); ignored when `mask` is connected. |
 | `chroma_tolerance` | How close to `chroma_key` still counts as background. Bigger = keys more aggressively. |
-| `fill` | Solid color painted into the transparent area (`dominant` / `black` / `magenta`), because an RGB tensor needs *some* value there. |
+| `fill` | What to put in the transparent area: `edge` (default) edge-pads it with the nearest opaque palette color, so no black background and no halo on resize; `dominant` / `black` / `magenta` give a flat, keyable color instead. |
 
 | Output | Usage |
 | --- | --- |
-| `quantized_image` | Quantized RGB. The transparent area holds `fill` — that is the "background" you see. |
+| `quantized_image` | Quantized RGB. The transparent area is edge-padded (default) or holds `fill`. |
 | `hex_palette` | Opaque colors only, de-duplicated. |
-| `mask` | The alpha, unchanged. |
+| `mask` | The alpha, unchanged (1 = opaque, 0 = transparent). |
 
 Unlike the plain **Quantize (Max Colors)** node, transparent pixels never enter
 the clustering, so chroma-key residue can no longer produce purple noise.
@@ -270,18 +271,28 @@ merging and quantizing.
 | --- | --- |
 | `image` | Image whose transparent area holds a flat fill color. |
 | `mask` (optional) | Alpha. Resampled automatically if its size differs from the image. |
+| `mask_mode` (optional) | `auto` / `opaque_is_1` / `opaque_is_0` — same meaning as above. Watch out: ComfyUI's `LoadImage` MASK is **1 = transparent**. |
 | `chroma_key` / `chroma_tolerance` | Alternative to `mask` when only a solid background color is known. |
 | `alpha_threshold` | Alpha at or above this counts as opaque (the color source for padding). |
 
 | Output | Usage |
 | --- | --- |
 | `image` | Fill-free RGB, safe to resize. |
-| `mask` | Alpha, unchanged. |
+| `mask` | Alpha, unchanged (1 = opaque). |
+| `report` | One-line summary of what it did — also printed to the console. |
 
 The transparent area is **edge-padded**: every pixel outside the mask is
 repainted with its nearest opaque neighbor's color. No fill color survives, so a
 bilinear/bicubic/lanczos resize cannot smear a black or white halo into the
 silhouette.
+
+If nothing changes, read the `report` / console line:
+
+| `report` says | Meaning |
+| --- | --- |
+| `transparency from none -> assumed all opaque` | The `mask` socket is empty; connect Quantize's `mask` (or `LoadImage`'s `MASK`). |
+| `repainted 0.0%` | The mask says every pixel is solid — usually a flipped convention, try the other `mask_mode`. |
+| `mask_mode opaque_is_0 (auto)` | `auto` detected a `LoadImage`-style mask (1 = transparent) and inverted it. |
 
 ### 12. Pixel Grid: Defringe (remove edge color bleed)
 

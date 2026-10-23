@@ -417,11 +417,16 @@ class PixelGrid_KMeansSkipTransparent:
     extra palette slot when fill="dominant").
 
     Outputs:
-      - quantized_image (RGB): filled so it works as a plain RGB tensor.
+      - quantized_image (RGB): quantized artwork. Transparent pixels are filled
+        with `fill` (dominant/black/magenta) only because an RGB tensor cannot
+        hold transparency -- the real alpha is in `mask`.
       - hex_palette (STRING): opaque colors only, de-duplicated.
       - mask (MASK): the alpha (1=opaque, 0=transparent) for re-compositing.
-      - rgba_image (IMAGE, 4-channel): RGBA with the mask as alpha -- feed this
-        straight to SaveImage for a genuinely transparent PNG (no black bg).
+
+    ComfyUI's IMAGE type is RGB-native, so this node does NOT emit a 4-channel
+    RGBA IMAGE (the UI renders that as channel-shifted noise). To get a real
+    transparent PNG, chain `mask` + `quantized_image` into
+    `Pixel Grid: Save Transparent PNG`, which writes actual RGBA.
     """
 
     @classmethod
@@ -439,8 +444,8 @@ class PixelGrid_KMeansSkipTransparent:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING", "MASK", "IMAGE")
-    RETURN_NAMES = ("quantized_image", "hex_palette", "mask", "rgba_image")
+    RETURN_TYPES = ("IMAGE", "STRING", "MASK")
+    RETURN_NAMES = ("quantized_image", "hex_palette", "mask")
     FUNCTION = "quantize"
     CATEGORY = "Pixel Grid Helpers"
 
@@ -475,8 +480,7 @@ class PixelGrid_KMeansSkipTransparent:
         # Fallback: nothing opaque -> just pass through
         if opaque_px.shape[0] == 0:
             out_mask = opaque.reshape(B, H, W).to(torch.float32)
-            rgba = torch.cat([image, out_mask.unsqueeze(-1)], dim=-1)
-            return (image, "", out_mask, rgba)
+            return (image, "", out_mask)
 
         # K-Means (10 iters) on OPAQUE pixels only
         n = opaque_px.shape[0]
@@ -519,13 +523,7 @@ class PixelGrid_KMeansSkipTransparent:
         hex_string = ", ".join(rgb_to_hex(list(c)) for c in unique_pal)
 
         out_mask = opaque.reshape(B, H, W).to(torch.float32)
-
-        # True transparent output: RGBA with the opaque mask as alpha. The
-        # filled `quantized_image` (above) keeps a solid fill color only so it
-        # stays usable as a plain RGB tensor; here the alpha restores real
-        # transparency, so SaveImage/preview no longer show a black background.
-        rgba_img = torch.cat([out_img, out_mask.unsqueeze(-1)], dim=-1)
-        return (out_img, hex_string, out_mask, rgba_img)
+        return (out_img, hex_string, out_mask)
 
 
 class PixelGrid_Defringe:
@@ -616,3 +614,92 @@ class PixelGrid_Defringe:
             out[b] = torch.from_numpy(fixed).to(image.device)
 
         return (out, alpha)
+
+
+class PixelGrid_SaveTransparentPNG:
+    """Save an IMAGE + MASK pair as a genuinely transparent RGBA PNG.
+
+    Why this exists: ComfyUI's IMAGE type is RGB-native. A 4-channel IMAGE is
+    non-standard and the node preview renders it as channel-shifted noise. This
+    node therefore does the RGBA merge in plain Python/PIL and writes a real
+    transparent PNG file, so alpha is guaranteed correct and previews cleanly.
+
+    Use it as the final step:
+        Pixel Grid: Quantize Skip Transparent -> quantized_image + mask
+        Pixel Grid: Save Transparent PNG      <- this node
+
+    `background` lets you optionally flatten onto a solid color instead of
+    keeping transparency (useful to eyeball the result on white/black).
+    """
+
+    def __init__(self):
+        self.type = "output"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "filename_prefix": ("STRING", {"default": "pixel_art"}),
+            },
+            "optional": {
+                "mask": ("MASK",),
+                "background": (["transparent", "white", "black", "magenta"],
+                               {"default": "transparent"}),
+            },
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "save"
+    OUTPUT_NODE = True
+    CATEGORY = "Pixel Grid Helpers"
+
+    def save(self, image, filename_prefix="pixel_art", mask=None,
+             background="transparent"):
+        import os
+        import numpy as np
+        from PIL import Image
+
+        try:
+            import folder_paths
+            output_dir = folder_paths.get_output_directory()
+            (full_output_folder, filename, counter, subfolder,
+             filename_prefix) = folder_paths.get_save_image_path(
+                filename_prefix, output_dir, image.shape[2], image.shape[1])
+        except Exception:
+            # Standalone / test fallback (no ComfyUI folder_paths available)
+            full_output_folder = os.getcwd()
+            filename, subfolder, counter = filename_prefix, "", 1
+
+        results = []
+        bg_map = {
+            "white": (255, 255, 255, 255),
+            "black": (0, 0, 0, 255),
+            "magenta": (255, 0, 255, 255),
+        }
+
+        for i in range(image.shape[0]):
+            rgb = (255.0 * image[i, :, :, :3].cpu().numpy()).clip(0, 255).astype(np.uint8)
+
+            if mask is not None:
+                m = mask[i] if i < mask.shape[0] else mask[0]
+                alpha = (255.0 * m.cpu().numpy()).clip(0, 255).astype(np.uint8)
+                if alpha.shape != rgb.shape[:2]:
+                    from PIL import Image as _PILImage
+                    alpha = np.array(_PILImage.fromarray(alpha).resize(
+                        (rgb.shape[1], rgb.shape[0]), _PILImage.NEAREST))
+                img = Image.fromarray(np.dstack([rgb, alpha]), "RGBA")
+            else:
+                img = Image.fromarray(rgb, "RGB").convert("RGBA")
+
+            if background in bg_map:
+                base = Image.new("RGBA", img.size, bg_map[background])
+                img = Image.alpha_composite(base, img)
+
+            fname = f"{filename}_{counter:05}_.png"
+            img.save(os.path.join(full_output_folder, fname), compress_level=4)
+            results.append({"filename": fname, "subfolder": subfolder,
+                            "type": self.type})
+            counter += 1
+
+        return {"ui": {"images": results}}

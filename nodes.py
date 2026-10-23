@@ -512,3 +512,93 @@ class PixelGrid_KMeansSkipTransparent:
 
         out_mask = opaque.reshape(B, H, W).to(torch.float32)
         return (out_img, hex_string, out_mask)
+
+
+class PixelGrid_Defringe:
+    """Node: remove colored/white fringing trapped in transparent edges.
+
+    Background removal usually sets alpha to transparent but leaves the OLD
+    background RGB sitting inside those pixels (white, magenta chroma-key
+    residue, etc.). When the image is later resized with a smoothing filter,
+    that residue smears into a visible halo.
+
+    This node replaces every NON-opaque pixel's RGB with the color of the
+    NEAREST opaque pixel (found via an exact Euclidean distance transform), so
+    there is no color mismatch left to bleed. The alpha/mask is left untouched,
+    so genuine anti-aliasing is preserved and only the fringe *color* is
+    corrected. Transparent pixels stay invisible either way.
+
+    Works for:
+      - a MASK input (e.g. LoadImage's mask), or
+      - a chroma_key hex + tolerance (treat near-key colors as transparent), or
+      - nothing supplied -> passes through unchanged.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            },
+            "optional": {
+                "mask": ("MASK",),
+                "chroma_key": ("STRING", {"multiline": False, "default": ""}),
+                "chroma_tolerance": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "alpha_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("defringed_image", "mask")
+    FUNCTION = "defringe"
+    CATEGORY = "Pixel Grid Helpers"
+
+    @staticmethod
+    def _alpha(image, mask, chroma_key, chroma_tolerance):
+        B, H, W, _ = image.shape
+        n = B * H * W
+        if mask is not None:
+            m = mask.reshape(-1)
+            if m.shape[0] != n:
+                m = m[:n]
+            return m.reshape(B, H, W).to(torch.float32)
+        if chroma_key and chroma_key.strip():
+            key = torch.tensor(
+                list(hex_to_rgb(chroma_key.strip())),
+                dtype=torch.float32, device=image.device,
+            ) / 255.0
+            px = image.reshape(-1, 3)
+            dist = torch.sqrt(((px - key) ** 2).sum(dim=1))
+            return (dist > chroma_tolerance).to(torch.float32).reshape(B, H, W)
+        # No transparency info -> everything opaque, nothing to defringe
+        return torch.ones(B, H, W, dtype=torch.float32, device=image.device)
+
+    def defringe(self, image, mask=None, chroma_key="", chroma_tolerance=0.10,
+                 alpha_threshold=0.5):
+        import scipy.ndimage as ndi
+
+        B, H, W, _ = image.shape
+        alpha = self._alpha(image, mask, chroma_key, chroma_tolerance)  # [B,H,W] 0..1
+        rgb = image[..., :3]                                            # [B,H,W,3]
+        out = rgb.clone()
+
+        for b in range(B):
+            a = alpha[b].cpu().numpy()                 # [H,W]
+            opaque = a >= alpha_threshold
+            if opaque.sum() == 0 or bool(opaque.all()):
+                continue  # nothing transparent to fix (or all transparent) -> keep
+
+            # For each transparent pixel, coordinates of the nearest opaque pixel.
+            # scipy treats NONZERO input as the feature and returns the nearest
+            # ZERO, so we pass the TRANSPARENT mask (~opaque): its zeros are the
+            # opaque pixels, and the returned indices point at the nearest one.
+            _, inds = ndi.distance_transform_edt(~opaque, return_indices=True)
+            nr = inds[0]                               # row index of nearest opaque
+            nc = inds[1]                               # col index of nearest opaque
+            src = rgb[b].cpu().numpy()
+            nearest = src[nr, nc]                     # [H,W,3]
+            fixed = src.copy()
+            fixed[~opaque] = nearest[~opaque]
+            out[b] = torch.from_numpy(fixed).to(image.device)
+
+        return (out, alpha)

@@ -401,3 +401,114 @@ class GridMedianFixer:
             best_index = torch.argmin(torch.stack(scores)).item()
             best_y, best_x = phases[best_index]
             return self._phase_outputs(image, grid_size, best_y, best_x)
+
+
+class PixelGrid_KMeansSkipTransparent:
+    """Node: K-Means Quantize that SKIPS transparent pixels.
+
+    The original PixelGrid_KMeans operates on RGB only (ComfyUI IMAGE has no
+    alpha), so the colored fringe left behind by background removal (e.g.
+    magenta 255,0,255) gets quantized too and bleeds into the palette as
+    purple/magenta "noise". This node excludes transparent pixels from the
+    clustering, so the background can never pollute the palette.
+
+    Transparent pixels are filled with a single uniform color afterwards so
+    they stay invisible once the mask is re-attached (and never claim an
+    extra palette slot when fill="dominant").
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "max_colors": ("INT", {"default": 32, "min": 1, "max": 256}),
+            },
+            "optional": {
+                "mask": ("MASK",),
+                "chroma_key": ("STRING", {"multiline": False, "default": ""}),
+                "chroma_tolerance": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "fill": (["dominant", "black", "magenta"], {"default": "dominant"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "MASK")
+    RETURN_NAMES = ("quantized_image", "hex_palette", "mask")
+    FUNCTION = "quantize"
+    CATEGORY = "Pixel Grid Helpers"
+
+    @staticmethod
+    def _to_opaque_mask(image, mask, chroma_key, chroma_tolerance):
+        B, H, W, _ = image.shape
+        n = B * H * W
+        if mask is not None:
+            m = mask.reshape(-1)
+            if m.shape[0] != n:
+                # take only the first plane / first batch worth of pixels
+                m = m[:n]
+            return (m > 0.5)
+        if chroma_key and chroma_key.strip():
+            key = torch.tensor(
+                list(hex_to_rgb(chroma_key.strip())),
+                dtype=torch.float32, device=image.device,
+            ) / 255.0
+            px = image.reshape(-1, 3)
+            dist = torch.sqrt(((px - key) ** 2).sum(dim=1))
+            return (dist > chroma_tolerance)
+        # No transparency info supplied -> behave exactly like the original node
+        return torch.ones(n, dtype=torch.bool, device=image.device)
+
+    def quantize(self, image, max_colors, mask=None, chroma_key="",
+                 chroma_tolerance=0.10, fill="dominant"):
+        B, H, W, _ = image.shape
+        pixels = image.reshape(-1, 3)            # [N, 3]
+        opaque = self._to_opaque_mask(image, mask, chroma_key, chroma_tolerance)
+        opaque_px = pixels[opaque]
+
+        # Fallback: nothing opaque -> just pass through
+        if opaque_px.shape[0] == 0:
+            out_mask = opaque.reshape(B, H, W).to(torch.float32)
+            return (image, "", out_mask)
+
+        # K-Means (10 iters) on OPAQUE pixels only
+        n = opaque_px.shape[0]
+        idx = torch.randperm(n)[:max_colors]
+        centroids = opaque_px[idx].clone()
+        for _ in range(10):
+            d = torch.cdist(opaque_px, centroids)
+            labels = torch.argmin(d, dim=1)
+            new_c = []
+            for i in range(max_colors):
+                mm = (labels == i)
+                if mm.any():
+                    new_c.append(opaque_px[mm].mean(dim=0))
+                else:
+                    ridx = torch.randint(0, n, (1,))
+                    new_c.append(opaque_px[ridx].squeeze())
+            centroids = torch.stack(new_c)
+
+        d = torch.cdist(opaque_px, centroids)
+        labels = torch.argmin(d, dim=1)
+
+        # Reconstruct output RGB
+        out = pixels.clone()
+        out[opaque] = centroids[labels]
+
+        if fill == "black":
+            fcol = torch.tensor([0.0, 0.0, 0.0], device=image.device)
+        elif fill == "magenta":
+            fcol = torch.tensor([1.0, 0.0, 1.0], device=image.device)
+        else:  # dominant -> most populated centroid (reuses an existing slot)
+            counts = torch.bincount(labels, minlength=max_colors)
+            fcol = centroids[counts.argmax()].clone()
+        out[~opaque] = fcol
+
+        out_img = out.reshape(image.shape)
+
+        # Palette = opaque centroids only (no purple noise), de-duplicated
+        palette_rgb = (centroids * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+        unique_pal = sorted({tuple(int(v) for v in c) for c in palette_rgb})
+        hex_string = ", ".join(rgb_to_hex(list(c)) for c in unique_pal)
+
+        out_mask = opaque.reshape(B, H, W).to(torch.float32)
+        return (out_img, hex_string, out_mask)

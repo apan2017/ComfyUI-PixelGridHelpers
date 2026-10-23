@@ -5,7 +5,8 @@ from .nodes import (
     PixelGrid_Analyze,
     PixelGrid_PaletteToImage,
     GridMedianFixer,
-    PixelGrid_CreateSolidColorImage
+    PixelGrid_CreateSolidColorImage,
+    PixelGrid_KMeansSkipTransparent,
 )
 from .autofixer import PixelGrid_Autofixer
 from .color_names import PixelGrid_HexToNames
@@ -19,7 +20,8 @@ NODE_CLASS_MAPPINGS = {
     "GridMedianFixer": GridMedianFixer,
     "PixelGrid_CreateSolidColorImage": PixelGrid_CreateSolidColorImage,
     "PixelGrid_Autofixer": PixelGrid_Autofixer,
-    "PixelGrid_HexToNames": PixelGrid_HexToNames
+    "PixelGrid_HexToNames": PixelGrid_HexToNames,
+    "PixelGrid_KMeansSkipTransparent": PixelGrid_KMeansSkipTransparent,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -31,7 +33,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "GridMedianFixer": "Pixel Grid: Median Fixer",
     "PixelGrid_CreateSolidColorImage": "Pixel Grid: Create Solid Color Image",
     "PixelGrid_Autofixer": "Pixel Grid: Autofixer",
-    "PixelGrid_HexToNames": "Pixel Grid: HEX to Color Names"
+    "PixelGrid_HexToNames": "Pixel Grid: HEX to Color Names",
+    "PixelGrid_KMeansSkipTransparent": "Pixel Grid: Quantize Skip Transparent"
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

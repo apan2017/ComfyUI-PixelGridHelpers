@@ -8,7 +8,7 @@ from .nodes import (
     PixelGrid_CreateSolidColorImage,
     PixelGrid_KMeansSkipTransparent,
     PixelGrid_Defringe,
-    PixelGrid_SaveTransparentPNG,
+    PixelGrid_RestoreTransparency,
 )
 from .autofixer import PixelGrid_Autofixer
 from .color_names import PixelGrid_HexToNames
@@ -25,7 +25,7 @@ NODE_CLASS_MAPPINGS = {
     "PixelGrid_HexToNames": PixelGrid_HexToNames,
     "PixelGrid_KMeansSkipTransparent": PixelGrid_KMeansSkipTransparent,
     "PixelGrid_Defringe": PixelGrid_Defringe,
-    "PixelGrid_SaveTransparentPNG": PixelGrid_SaveTransparentPNG,
+    "PixelGrid_RestoreTransparency": PixelGrid_RestoreTransparency,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -40,7 +40,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PixelGrid_HexToNames": "Pixel Grid: HEX to Color Names",
     "PixelGrid_KMeansSkipTransparent": "Pixel Grid: Quantize Skip Transparent",
     "PixelGrid_Defringe": "Pixel Grid: Defringe (remove edge color bleed)",
-    "PixelGrid_SaveTransparentPNG": "Pixel Grid: Save Transparent PNG"
+    "PixelGrid_RestoreTransparency": "Pixel Grid: Restore Transparency (remove fill)"
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

@@ -234,6 +234,61 @@ a three- or six-digit HEX color, with or without the leading `#`.
 | --- | --- |
 | `image` | The generated solid-color image. |
 
+## Transparency helpers
+
+ComfyUI's `IMAGE` is a 3-channel RGB tensor — it cannot store alpha. These three
+nodes make transparent pixel art work anyway (`alpha` travels in the `MASK`
+socket instead of as a 4th channel).
+
+### 10. Pixel Grid: Quantize Skip Transparent
+
+| Input | Usage |
+| --- | --- |
+| `image` | Source image. |
+| `max_colors` | Palette size, counted over **opaque pixels only**. |
+| `mask` (optional) | Alpha, e.g. `LoadImage`'s `MASK` output. |
+| `chroma_key` (optional) | Hex color treated as background (e.g. `#FF00FF`); ignored when `mask` is connected. |
+| `chroma_tolerance` | How close to `chroma_key` still counts as background. Bigger = keys more aggressively. |
+| `fill` | Solid color painted into the transparent area (`dominant` / `black` / `magenta`), because an RGB tensor needs *some* value there. |
+
+| Output | Usage |
+| --- | --- |
+| `quantized_image` | Quantized RGB. The transparent area holds `fill` — that is the "background" you see. |
+| `hex_palette` | Opaque colors only, de-duplicated. |
+| `mask` | The alpha, unchanged. |
+
+Unlike the plain **Quantize (Max Colors)** node, transparent pixels never enter
+the clustering, so chroma-key residue can no longer produce purple noise.
+
+### 11. Pixel Grid: Restore Transparency (remove fill)
+
+Mid-pipeline node: takes the `quantized_image` + `mask` above and keys the fill
+back out, returning a normal `IMAGE` + `MASK` pair so you can keep scaling,
+merging and quantizing.
+
+| Input | Usage |
+| --- | --- |
+| `image` | Image whose transparent area holds a flat fill color. |
+| `mask` (optional) | Alpha. Resampled automatically if its size differs from the image. |
+| `chroma_key` / `chroma_tolerance` | Alternative to `mask` when only a solid background color is known. |
+| `alpha_threshold` | Alpha at or above this counts as opaque (the color source for padding). |
+
+| Output | Usage |
+| --- | --- |
+| `image` | Fill-free RGB, safe to resize. |
+| `mask` | Alpha, unchanged. |
+
+The transparent area is **edge-padded**: every pixel outside the mask is
+repainted with its nearest opaque neighbor's color. No fill color survives, so a
+bilinear/bicubic/lanczos resize cannot smear a black or white halo into the
+silhouette.
+
+### 12. Pixel Grid: Defringe (remove edge color bleed)
+
+Same kernel, different use: keep the alpha as-is and only fix the *color* trapped
+in semi-transparent edge pixels (white / magenta residue left by background
+removal), which is what makes halos appear when the sprite is resized.
+
 ## Example Workflows
 
 - **Clean generated pixel art:** Image -> Autofixer -> Preview Image or Save Image.
@@ -241,6 +296,7 @@ a three- or six-digit HEX color, with or without the leading `#`.
 - **Inspect and describe colors:** Connect any `hex_palette` output to Palette to Image for swatches and HEX to Color Names for readable names.
 - **Recover a known pixel grid:** Image -> Median Fixer -> use `downscaled_image` for editing or `original_size_image` for an enlarged result.
 - **Create a flat background:** Create Solid Color Image -> Preview Image or combine it with another image.
+- **Transparent pixel art, end to end:** Image -> *Quantize Skip Transparent* (`quantized_image`, `mask`) -> *Restore Transparency* -> resize / merge -> composite the `mask` back as alpha at the very end. Insert *Defringe* right after background removal if the edges still carry white/magenta residue.
 
 ## Attribution
 

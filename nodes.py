@@ -8,6 +8,66 @@ def hex_to_rgb(hex_str):
 def rgb_to_hex(rgb):
     return '#{:02x}{:02x}{:02x}'.format(int(rgb[0]), int(rgb[1]), int(rgb[2]))
 
+
+def _resolve_alpha(image, mask=None, chroma_key="", chroma_tolerance=0.10):
+    """Build a [B,H,W] float alpha (0=transparent, 1=opaque) from any source.
+
+    Priority: MASK input > chroma_key hex > everything opaque.
+
+    The mask is resampled to the image size when they disagree (happens when the
+    IMAGE was scaled but the MASK was not) and broadcast across the batch, so
+    callers never have to worry about matching shapes.
+    """
+    B, H, W, _ = image.shape
+    if mask is not None:
+        m = mask.to(device=image.device, dtype=torch.float32)
+        if m.dim() == 4:            # [B,H,W,1] from some packs
+            m = m[..., 0]
+        elif m.dim() == 2:          # bare [H,W]
+            m = m.unsqueeze(0)
+        if tuple(m.shape[-2:]) != (H, W):
+            m = torch.nn.functional.interpolate(
+                m.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=False
+            ).squeeze(1)
+        if m.shape[0] < B:
+            m = torch.cat([m, m[-1:].expand(B - m.shape[0], H, W)], dim=0)
+        elif m.shape[0] > B:
+            m = m[:B]
+        return m.clamp(0.0, 1.0)
+    if chroma_key and chroma_key.strip():
+        key = torch.tensor(
+            list(hex_to_rgb(chroma_key.strip())),
+            dtype=torch.float32, device=image.device,
+        ) / 255.0
+        px = image[..., :3].reshape(-1, 3)
+        dist = torch.sqrt(((px - key) ** 2).sum(dim=1))
+        return (dist > chroma_tolerance).to(torch.float32).reshape(B, H, W)
+    return torch.ones((B, H, W), dtype=torch.float32, device=image.device)
+
+
+def _edge_extend_rgb(rgb, opaque):
+    """Repaint every NON-opaque pixel with its nearest opaque neighbour's color.
+
+    `rgb` is a float32 numpy [H,W,3]; `opaque` is a bool [H,W]. The nearest
+    match is exact (Euclidean distance transform), so the transparent region
+    ends up holding real artwork colors instead of a flat fill. That is what
+    makes the image safe to resample: there is no foreign fill color left for a
+    smoothing filter to smear into a halo.
+    """
+    import scipy.ndimage as ndi
+
+    if opaque.all() or not opaque.any():
+        return rgb
+
+    # scipy treats NONZERO input as the feature and returns the nearest ZERO,
+    # so we feed it the TRANSPARENT mask: its zeros are the opaque pixels and
+    # the returned indices point at the nearest one.
+    _, inds = ndi.distance_transform_edt(~opaque, return_indices=True)
+    nearest = rgb[inds[0], inds[1]]
+    out = rgb.copy()
+    out[~opaque] = nearest[~opaque]
+    return out
+
 class PixelGrid_CreateSolidColorImage:
     @classmethod
     def INPUT_TYPES(cls):
@@ -423,10 +483,12 @@ class PixelGrid_KMeansSkipTransparent:
       - hex_palette (STRING): opaque colors only, de-duplicated.
       - mask (MASK): the alpha (1=opaque, 0=transparent) for re-compositing.
 
-    ComfyUI's IMAGE type is RGB-native, so this node does NOT emit a 4-channel
-    RGBA IMAGE (the UI renders that as channel-shifted noise). To get a real
-    transparent PNG, chain `mask` + `quantized_image` into
-    `Pixel Grid: Save Transparent PNG`, which writes actual RGBA.
+    ComfyUI's IMAGE type is RGB-native (a 4-channel IMAGE is not standard and is
+    rejected/noised downstream), so this node does NOT try to emit RGBA. The
+    alpha rides along in `mask`; feed `quantized_image` + `mask` into
+    `Pixel Grid: Restore Transparency` to key the fill back out and continue
+    the pipeline (the fill color would otherwise smear into the edges on any
+    smooth resize).
     """
 
     @classmethod
@@ -567,139 +629,75 @@ class PixelGrid_Defringe:
 
     @staticmethod
     def _alpha(image, mask, chroma_key, chroma_tolerance):
-        B, H, W, _ = image.shape
-        n = B * H * W
-        if mask is not None:
-            m = mask.reshape(-1)
-            if m.shape[0] != n:
-                m = m[:n]
-            return m.reshape(B, H, W).to(torch.float32)
-        if chroma_key and chroma_key.strip():
-            key = torch.tensor(
-                list(hex_to_rgb(chroma_key.strip())),
-                dtype=torch.float32, device=image.device,
-            ) / 255.0
-            px = image.reshape(-1, 3)
-            dist = torch.sqrt(((px - key) ** 2).sum(dim=1))
-            return (dist > chroma_tolerance).to(torch.float32).reshape(B, H, W)
-        # No transparency info -> everything opaque, nothing to defringe
-        return torch.ones(B, H, W, dtype=torch.float32, device=image.device)
+        return _resolve_alpha(image, mask, chroma_key, chroma_tolerance)
 
     def defringe(self, image, mask=None, chroma_key="", chroma_tolerance=0.10,
                  alpha_threshold=0.5):
-        import scipy.ndimage as ndi
-
         B, H, W, _ = image.shape
-        alpha = self._alpha(image, mask, chroma_key, chroma_tolerance)  # [B,H,W] 0..1
-        rgb = image[..., :3]                                            # [B,H,W,3]
-        out = rgb.clone()
+        alpha = _resolve_alpha(image, mask, chroma_key, chroma_tolerance)
+        out = image[..., :3].clone()
 
         for b in range(B):
-            a = alpha[b].cpu().numpy()                 # [H,W]
-            opaque = a >= alpha_threshold
-            if opaque.sum() == 0 or bool(opaque.all()):
-                continue  # nothing transparent to fix (or all transparent) -> keep
-
-            # For each transparent pixel, coordinates of the nearest opaque pixel.
-            # scipy treats NONZERO input as the feature and returns the nearest
-            # ZERO, so we pass the TRANSPARENT mask (~opaque): its zeros are the
-            # opaque pixels, and the returned indices point at the nearest one.
-            _, inds = ndi.distance_transform_edt(~opaque, return_indices=True)
-            nr = inds[0]                               # row index of nearest opaque
-            nc = inds[1]                               # col index of nearest opaque
-            src = rgb[b].cpu().numpy()
-            nearest = src[nr, nc]                     # [H,W,3]
-            fixed = src.copy()
-            fixed[~opaque] = nearest[~opaque]
-            out[b] = torch.from_numpy(fixed).to(image.device)
+            opaque = alpha[b].cpu().numpy() >= alpha_threshold
+            fixed = _edge_extend_rgb(image[b, :, :, :3].cpu().numpy(), opaque)
+            out[b] = torch.from_numpy(fixed).to(device=out.device, dtype=out.dtype)
 
         return (out, alpha)
 
 
-class PixelGrid_SaveTransparentPNG:
-    """Save an IMAGE + MASK pair as a genuinely transparent RGBA PNG.
+class PixelGrid_RestoreTransparency:
+    """Node: undo the quantizer's fill color and hand back RGB + alpha.
 
-    Why this exists: ComfyUI's IMAGE type is RGB-native. A 4-channel IMAGE is
-    non-standard and the node preview renders it as channel-shifted noise. This
-    node therefore does the RGBA merge in plain Python/PIL and writes a real
-    transparent PNG file, so alpha is guaranteed correct and previews cleanly.
+    Why this exists
+    ---------------
+    A ComfyUI IMAGE is a 3-channel RGB tensor -- it physically cannot carry
+    alpha. So `Pixel Grid: Quantize Skip Transparent` has to paint the
+    transparent region with SOME solid color (its `fill`: dominant/black/
+    magenta). That paint is the "black background" you see, and if the image is
+    then resized with a smoothing filter, the paint smears into the silhouette
+    and becomes a black/colored halo around the sprite.
 
-    Use it as the final step:
-        Pixel Grid: Quantize Skip Transparent -> quantized_image + mask
-        Pixel Grid: Save Transparent PNG      <- this node
+    This is the mid-pipeline counterpart: it drops the paint back out and
+    returns a normal IMAGE + MASK pair, so you can keep scaling, merging and
+    quantizing, and only composite the alpha at the very end.
 
-    `background` lets you optionally flatten onto a solid color instead of
-    keeping transparency (useful to eyeball the result on white/black).
+    The RGB it emits is *edge-padded*: every pixel outside the mask is repainted
+    with the color of its nearest opaque neighbour. Nothing of the fill color
+    survives, so resampling with bilinear / bicubic / lanczos cannot drag a
+    foreign color into the edge. The MASK output is the alpha, unchanged.
+
+    Outputs:
+      image (IMAGE): fill-free RGB, safe to resize.
+      mask  (MASK) : alpha, same values as the input mask (1=opaque, 0=clear).
     """
 
-    def __init__(self):
-        self.type = "output"
-
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(s):
         return {
             "required": {
                 "image": ("IMAGE",),
-                "filename_prefix": ("STRING", {"default": "pixel_art"}),
             },
             "optional": {
                 "mask": ("MASK",),
-                "background": (["transparent", "white", "black", "magenta"],
-                               {"default": "transparent"}),
-            },
+                "chroma_key": ("STRING", {"multiline": False, "default": ""}),
+                "chroma_tolerance": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "alpha_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+            }
         }
 
-    RETURN_TYPES = ()
-    FUNCTION = "save"
-    OUTPUT_NODE = True
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "mask")
+    FUNCTION = "restore"
     CATEGORY = "Pixel Grid Helpers"
 
-    def save(self, image, filename_prefix="pixel_art", mask=None,
-             background="transparent"):
-        import os
-        import numpy as np
-        from PIL import Image
+    def restore(self, image, mask=None, chroma_key="", chroma_tolerance=0.10,
+                alpha_threshold=0.5):
+        alpha = _resolve_alpha(image, mask, chroma_key, chroma_tolerance)
+        out = image[..., :3].clone()
 
-        try:
-            import folder_paths
-            output_dir = folder_paths.get_output_directory()
-            (full_output_folder, filename, counter, subfolder,
-             filename_prefix) = folder_paths.get_save_image_path(
-                filename_prefix, output_dir, image.shape[2], image.shape[1])
-        except Exception:
-            # Standalone / test fallback (no ComfyUI folder_paths available)
-            full_output_folder = os.getcwd()
-            filename, subfolder, counter = filename_prefix, "", 1
+        for b in range(image.shape[0]):
+            opaque = alpha[b].cpu().numpy() >= alpha_threshold
+            fixed = _edge_extend_rgb(image[b, :, :, :3].cpu().numpy(), opaque)
+            out[b] = torch.from_numpy(fixed).to(device=out.device, dtype=out.dtype)
 
-        results = []
-        bg_map = {
-            "white": (255, 255, 255, 255),
-            "black": (0, 0, 0, 255),
-            "magenta": (255, 0, 255, 255),
-        }
-
-        for i in range(image.shape[0]):
-            rgb = (255.0 * image[i, :, :, :3].cpu().numpy()).clip(0, 255).astype(np.uint8)
-
-            if mask is not None:
-                m = mask[i] if i < mask.shape[0] else mask[0]
-                alpha = (255.0 * m.cpu().numpy()).clip(0, 255).astype(np.uint8)
-                if alpha.shape != rgb.shape[:2]:
-                    from PIL import Image as _PILImage
-                    alpha = np.array(_PILImage.fromarray(alpha).resize(
-                        (rgb.shape[1], rgb.shape[0]), _PILImage.NEAREST))
-                img = Image.fromarray(np.dstack([rgb, alpha]), "RGBA")
-            else:
-                img = Image.fromarray(rgb, "RGB").convert("RGBA")
-
-            if background in bg_map:
-                base = Image.new("RGBA", img.size, bg_map[background])
-                img = Image.alpha_composite(base, img)
-
-            fname = f"{filename}_{counter:05}_.png"
-            img.save(os.path.join(full_output_folder, fname), compress_level=4)
-            results.append({"filename": fname, "subfolder": subfolder,
-                            "type": self.type})
-            counter += 1
-
-        return {"ui": {"images": results}}
+        return (out, alpha)

@@ -33,6 +33,9 @@ def _resolve_alpha(image, mask=None, chroma_key="", chroma_tolerance=0.10,
     IMAGE was scaled but the MASK was not) and broadcast across the batch.
     """
     B, H, W, _ = image.shape
+    alpha_mask = None
+    alpha_chroma = None
+
     if mask is not None:
         m = mask.to(device=image.device, dtype=torch.float32)
         if m.dim() == 4:            # [B,H,W,1] from some packs
@@ -57,13 +60,10 @@ def _resolve_alpha(image, mask=None, chroma_key="", chroma_tolerance=0.10,
             mode = OPAQUE_IS_0 if float(border.mean()) > 0.5 else OPAQUE_IS_1
         if mode == OPAQUE_IS_0:
             m = 1.0 - m
+        alpha_mask = m.clamp(0.0, 1.0)
 
         if info is not None:
-            info["mask_source"] = "mask input"
-            info["mask_mode"] = mode
-            if mode != mask_mode:
-                info["mask_mode"] += " (auto)"
-        return m.clamp(0.0, 1.0)
+            info["mask_mode"] = mode + (" (auto)" if mode != mask_mode else "")
 
     if chroma_key and chroma_key.strip():
         key = torch.tensor(
@@ -72,15 +72,66 @@ def _resolve_alpha(image, mask=None, chroma_key="", chroma_tolerance=0.10,
         ) / 255.0
         px = image[..., :3].reshape(-1, 3)
         dist = torch.sqrt(((px - key) ** 2).sum(dim=1))
+        alpha_chroma = (dist > chroma_tolerance).to(torch.float32).reshape(B, H, W)
+
+    if alpha_mask is not None and alpha_chroma is not None:
+        # Both supplied -> a pixel is only opaque when BOTH agree. Background
+        # removal often leaves mixed residue (e.g. magenta fringe + a black
+        # premultiply area), and a single chroma key can only catch one of them;
+        # intersecting keeps every pixel either source calls transparent.
+        if info is not None:
+            info["mask_source"] = (f"mask + chroma_key {chroma_key.strip()} "
+                                   f"tol {chroma_tolerance} (combined)")
+        return torch.minimum(alpha_mask, alpha_chroma)
+
+    if alpha_mask is not None:
+        if info is not None:
+            info["mask_source"] = "mask"
+        return alpha_mask
+
+    if alpha_chroma is not None:
         if info is not None:
             info["mask_source"] = f"chroma_key {chroma_key.strip()} tol {chroma_tolerance}"
             info["mask_mode"] = "-"
-        return (dist > chroma_tolerance).to(torch.float32).reshape(B, H, W)
+        return alpha_chroma
 
     if info is not None:
         info["mask_source"] = "none -> assumed all opaque"
         info["mask_mode"] = "-"
     return torch.ones((B, H, W), dtype=torch.float32, device=image.device)
+
+
+RESIDUE_COLORS = ("#000000", "#ff00ff")
+
+
+def _residue_warning(image, alpha):
+    """Flag exact black / magenta sitting in the *opaque* area.
+
+    A sprite whose "opaque" pixels are largely pure #000000 or #FF00FF is a
+    strong tell that background-removal residue was NOT keyed out (the image has
+    a real alpha channel, or the chroma key only caught half of it). Those
+    pixels get quantized as real artwork and show up as a black background that
+    no fill/defringe step can remove.
+    """
+    px = image[..., :3].reshape(-1, 3)
+    op = alpha.reshape(-1) > 0.5
+    if not bool(op.any()):
+        return ""
+    sel = px[op]
+    worst = ""
+    worst_frac = 0.0
+    for hx in RESIDUE_COLORS:
+        key = torch.tensor(list(hex_to_rgb(hx)), dtype=torch.float32,
+                           device=image.device) / 255.0
+        hit = int(((sel - key).abs().max(dim=1).values < 1e-3).sum())
+        frac = hit / max(1, sel.shape[0])
+        if frac > worst_frac:
+            worst, worst_frac = hx, frac
+    if worst_frac < 0.01:
+        return ""
+    return (f" | RESIDUE: {100.0 * worst_frac:.1f}% of the 'opaque' pixels are "
+            f"exactly {worst} -> connect the alpha MASK (LoadImage's MASK socket, "
+            f"mask_mode=auto); a single chroma key cannot remove mixed residue")
 
 
 def _edge_extend_rgb(rgb, opaque):
@@ -574,7 +625,8 @@ class PixelGrid_KMeansSkipTransparent:
         print(f"[Pixel Grid] Quantize Skip Transparent: {W}x{H} | "
               f"transparency from {info.get('mask_source')} | "
               f"mask_mode {info.get('mask_mode')} | "
-              f"opaque {100.0 * float(opaque.sum()) / max(1, opaque.numel()):.1f}%")
+              f"opaque {100.0 * float(opaque.sum()) / max(1, opaque.numel()):.1f}%"
+              + _residue_warning(image, opaque.reshape(B, H, W).to(torch.float32)))
 
         # Fallback: nothing opaque -> just pass through
         if opaque_px.shape[0] == 0:

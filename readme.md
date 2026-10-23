@@ -248,7 +248,7 @@ socket instead of as a 4th channel).
 | `max_colors` | Palette size, counted over **opaque pixels only**. |
 | `mask` (optional) | Alpha, e.g. `LoadImage`'s `MASK` output. |
 | `mask_mode` (optional) | Which way round the mask is: `auto` (default, decides from the image border), `opaque_is_1` (this pack's own masks) or `opaque_is_0` (ComfyUI `LoadImage`'s `MASK` is `1 - alpha`, i.e. **1 = transparent**). |
-| `chroma_key` (optional) | Hex color treated as background (e.g. `#FF00FF`); ignored when `mask` is connected. |
+| `chroma_key` (optional) | Hex color treated as background (e.g. `#FF00FF`). When `mask` is **also** connected the two are combined (a pixel is opaque only if both agree) — handy when background removal left mixed residue (magenta fringe *and* a black premultiplied area), which one key alone cannot catch. |
 | `chroma_tolerance` | How close to `chroma_key` still counts as background. Bigger = keys more aggressively. |
 | `fill` | What to put in the transparent area: `edge` (default) edge-pads it with the nearest opaque palette color, so no black background and no halo on resize; `dominant` / `black` / `magenta` give a flat, keyable color instead. |
 
@@ -260,6 +260,25 @@ socket instead of as a 4th channel).
 
 Unlike the plain **Quantize (Max Colors)** node, transparent pixels never enter
 the clustering, so chroma-key residue can no longer produce purple noise.
+
+### Troubleshooting: "the background is still black"
+
+A black background here is almost never the `fill` — it is **background residue
+that was classified as opaque and therefore quantized as artwork** (the palette
+then contains `#000000`). A sprite exported with alpha often keeps *mixed* RGB
+under the transparent pixels (magenta from one step, black from another), so a
+single `chroma_key` only removes part of it. The node now says so in the
+console:
+
+```
+opaque 79.8% | RESIDUE: 22.0% of the 'opaque' pixels are exactly #000000
+-> connect the alpha MASK (LoadImage's MASK socket, mask_mode=auto)
+```
+
+Fix: wire `LoadImage`'s `MASK` (output 1) into `mask` and leave `chroma_key`
+empty — `mask_mode=auto` detects that ComfyUI's mask is inverted (`1 =
+transparent`) from the image border. Real alpha removes the whole background at
+once, and `fill="edge"` then pads it with artwork colors instead of black.
 
 ### 11. Pixel Grid: Restore Transparency (remove fill)
 

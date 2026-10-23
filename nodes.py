@@ -415,6 +415,13 @@ class PixelGrid_KMeansSkipTransparent:
     Transparent pixels are filled with a single uniform color afterwards so
     they stay invisible once the mask is re-attached (and never claim an
     extra palette slot when fill="dominant").
+
+    Outputs:
+      - quantized_image (RGB): filled so it works as a plain RGB tensor.
+      - hex_palette (STRING): opaque colors only, de-duplicated.
+      - mask (MASK): the alpha (1=opaque, 0=transparent) for re-compositing.
+      - rgba_image (IMAGE, 4-channel): RGBA with the mask as alpha -- feed this
+        straight to SaveImage for a genuinely transparent PNG (no black bg).
     """
 
     @classmethod
@@ -432,8 +439,8 @@ class PixelGrid_KMeansSkipTransparent:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING", "MASK")
-    RETURN_NAMES = ("quantized_image", "hex_palette", "mask")
+    RETURN_TYPES = ("IMAGE", "STRING", "MASK", "IMAGE")
+    RETURN_NAMES = ("quantized_image", "hex_palette", "mask", "rgba_image")
     FUNCTION = "quantize"
     CATEGORY = "Pixel Grid Helpers"
 
@@ -468,7 +475,8 @@ class PixelGrid_KMeansSkipTransparent:
         # Fallback: nothing opaque -> just pass through
         if opaque_px.shape[0] == 0:
             out_mask = opaque.reshape(B, H, W).to(torch.float32)
-            return (image, "", out_mask)
+            rgba = torch.cat([image, out_mask.unsqueeze(-1)], dim=-1)
+            return (image, "", out_mask, rgba)
 
         # K-Means (10 iters) on OPAQUE pixels only
         n = opaque_px.shape[0]
@@ -511,7 +519,13 @@ class PixelGrid_KMeansSkipTransparent:
         hex_string = ", ".join(rgb_to_hex(list(c)) for c in unique_pal)
 
         out_mask = opaque.reshape(B, H, W).to(torch.float32)
-        return (out_img, hex_string, out_mask)
+
+        # True transparent output: RGBA with the opaque mask as alpha. The
+        # filled `quantized_image` (above) keeps a solid fill color only so it
+        # stays usable as a plain RGB tensor; here the alpha restores real
+        # transparency, so SaveImage/preview no longer show a black background.
+        rgba_img = torch.cat([out_img, out_mask.unsqueeze(-1)], dim=-1)
+        return (out_img, hex_string, out_mask, rgba_img)
 
 
 class PixelGrid_Defringe:
